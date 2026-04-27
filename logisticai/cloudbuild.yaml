@@ -1,0 +1,96 @@
+steps:
+  # ── Tests (parallel with build) ─────────────────────────────────────────
+  - name: "python:3.11-slim"
+    id: run-tests
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q pytest pytest-asyncio fastapi httpx redis python-dotenv PyJWT &&
+        cd tests &&
+        PYTHONPATH=../services/optimizer pytest integration/ -v --asyncio-mode=auto
+    waitFor: ["-"]
+
+  # ── Build images ────────────────────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-optimizer
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/optimizer:$COMMIT_SHA",
+           "-t", "gcr.io/$PROJECT_ID/optimizer:latest",
+           "./services/optimizer"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-inference
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/inference:$COMMIT_SHA",
+           "-t", "gcr.io/$PROJECT_ID/inference:latest",
+           "./services/inference"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: build-ws-hub
+    args: ["build", "-t", "gcr.io/$PROJECT_ID/ws-hub:$COMMIT_SHA",
+           "-t", "gcr.io/$PROJECT_ID/ws-hub:latest",
+           "./services/websocket-hub"]
+
+  # ── Push ────────────────────────────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-optimizer
+    args: ["push", "--all-tags", "gcr.io/$PROJECT_ID/optimizer"]
+    waitFor: ["build-optimizer", "run-tests"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-inference
+    args: ["push", "--all-tags", "gcr.io/$PROJECT_ID/inference"]
+    waitFor: ["build-inference", "run-tests"]
+
+  - name: "gcr.io/cloud-builders/docker"
+    id: push-ws-hub
+    args: ["push", "--all-tags", "gcr.io/$PROJECT_ID/ws-hub"]
+    waitFor: ["build-ws-hub", "run-tests"]
+
+  # ── Deploy to staging ───────────────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/kubectl"
+    id: deploy-staging
+    args:
+      - set
+      - image
+      - deployment/optimizer-service
+      - optimizer=gcr.io/$PROJECT_ID/optimizer:$COMMIT_SHA
+      - -n=logistics
+    env:
+      - "CLOUDSDK_CONTAINER_CLUSTER=logisticai-staging"
+      - "CLOUDSDK_COMPUTE_REGION=us-central1"
+    waitFor: ["push-optimizer", "push-inference", "push-ws-hub"]
+
+  # ── Canary: 10% of prod traffic ─────────────────────────────────────────
+  - name: "gcr.io/cloud-builders/kubectl"
+    id: canary-prod
+    args: ["apply", "-f", "k8s/canary.yaml", "-n", "logistics"]
+    env:
+      - "CLOUDSDK_CONTAINER_CLUSTER=logisticai-prod"
+      - "CLOUDSDK_COMPUTE_REGION=us-central1"
+    waitFor: ["deploy-staging"]
+
+  # ── Bake: 10 minutes, then full rollout ─────────────────────────────────
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: promote-full
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        echo "Baking canary for 10 minutes..."
+        sleep 600
+        gcloud deploy releases promote \
+          --release=$COMMIT_SHA \
+          --delivery-pipeline=logisticai-prod \
+          --region=us-central1 --quiet
+    waitFor: ["canary-prod"]
+
+images:
+  - "gcr.io/$PROJECT_ID/optimizer:$COMMIT_SHA"
+  - "gcr.io/$PROJECT_ID/inference:$COMMIT_SHA"
+  - "gcr.io/$PROJECT_ID/ws-hub:$COMMIT_SHA"
+
+timeout: "2400s"
+
+options:
+  machineType: "E2_HIGHCPU_8"
+  logging: CLOUD_LOGGING_ONLY

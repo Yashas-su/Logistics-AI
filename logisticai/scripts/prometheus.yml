@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: optimizer
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+    metrics_path: /metrics
+
+  - job_name: inference
+    static_configs:
+      - targets: ["host.docker.internal:8002"]
+    metrics_path: /metrics
+
+  - job_name: ws_hub
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+    metrics_path: /metrics
